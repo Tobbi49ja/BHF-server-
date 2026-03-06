@@ -1,0 +1,10 @@
+.idea/
+.env
+node_modules/
+
+package-lock.json
+dist/
+.vscode/
+backend.md
+file.md
+hello
