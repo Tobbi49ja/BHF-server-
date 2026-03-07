@@ -51,11 +51,13 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
         { path: "receiver", select: "fullName role" },
       ]);
 
-      // Emit via socket if available
       const io = req.app.get("io");
       if (io) {
-        io.to(receiverId.toString()).emit("newMessage", populated);
-        io.to(req.user._id.toString()).emit("newMessage", populated);
+        const rid = String(receiverId);
+        const sid = String(req.user._id);
+        // Only emit to receiver — sender already has optimistic message in UI
+        console.log(`[chat] emit newMessage → receiver room ${rid}`);
+        io.to(rid).emit("newMessage", populated);
       }
 
       res.status(201).json(populated);
@@ -128,6 +130,22 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
       const io = req.app.get("io");
       if (io) io.emit("userStatus", { userId: req.user._id, status });
       res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // Admin: clear all messages between admin and a user
+  router.delete("/messages/clear/:userId", protect, adminOnly, async (req, res) => {
+    try {
+      const { userId } = req.params;
+      await AtlasMessage.deleteMany({
+        $or: [
+          { sender: req.user._id, receiver: userId },
+          { sender: userId,       receiver: req.user._id },
+        ],
+      });
+      res.json({ ok: true, message: "Chat cleared" });
     } catch (err) {
       res.status(500).json({ message: err.message });
     }
