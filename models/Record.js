@@ -4,7 +4,6 @@ const addressSchema = new mongoose.Schema({
   street:   { type: String, trim: true, default: "" },
   street2:  { type: String, trim: true, default: "" },
   landmark: { type: String, trim: true, default: "" },
-  town:     { type: String, trim: true, default: "" },
   city:     { type: String, trim: true, default: "" },
   lga:      { type: String, trim: true, default: "" },
   state:    { type: String, trim: true, default: "" },
