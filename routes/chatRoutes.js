@@ -1,11 +1,25 @@
 import express from "express";
+import mongoose from "mongoose";
 import { createAuthMiddleware } from "../middleware/authMiddleware.js";
 
 export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
   const { protect, adminOnly } = createAuthMiddleware(atlasConn);
   const router = express.Router();
 
-  // Get conversation between current user and an admin (or user if admin)
+  // ── Unread count (MUST be before /messages/:userId) ──────
+  router.get("/messages/unread/count", protect, async (req, res) => {
+    try {
+      const count = await AtlasMessage.countDocuments({
+        receiver: req.user._id,
+        read: false,
+      });
+      res.json({ count });
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // ── Get conversation ──────────────────────────────────────
   router.get("/messages/:userId", protect, async (req, res) => {
     try {
       const { userId } = req.params;
@@ -20,7 +34,6 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
         .populate("receiver", "fullName role")
         .sort({ createdAt: 1 });
 
-      // Mark received messages as read
       await AtlasMessage.updateMany(
         { sender: userId, receiver: me, read: false },
         { read: true }
@@ -32,7 +45,7 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // Send a message
+  // ── Send message ──────────────────────────────────────────
   router.post("/messages", protect, async (req, res) => {
     try {
       const { receiverId, content, type = "message" } = req.body;
@@ -55,9 +68,10 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
       if (io) {
         const rid = String(receiverId);
         const sid = String(req.user._id);
-        // Only emit to receiver — sender already has optimistic message in UI
-        console.log(`[chat] emit newMessage → receiver room ${rid}`);
+        console.log(`[chat] emit newMessage → receiver ${rid}, sender ${sid}`);
         io.to(rid).emit("newMessage", populated);
+        // Also echo to sender so their chat panel updates in real time
+        if (rid !== sid) io.to(sid).emit("newMessage", populated);
       }
 
       res.status(201).json(populated);
@@ -66,20 +80,7 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // Get unread count for current user
-  router.get("/messages/unread/count", protect, async (req, res) => {
-    try {
-      const count = await AtlasMessage.countDocuments({
-        receiver: req.user._id,
-        read: false,
-      });
-      res.json({ count });
-    } catch (err) {
-      res.status(500).json({ message: err.message });
-    }
-  });
-
-  // Admin: get all users with last message + unread count
+  // ── Admin: all conversations with unread counts ───────────
   router.get("/admin/conversations", protect, adminOnly, async (req, res) => {
     try {
       const users = await AtlasUser.find({ role: { $ne: "Administrator" } })
@@ -111,7 +112,7 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // Admin: get first admin user ID (for non-admin users to message)
+  // ── Admin ID (for users to know who to message) ───────────
   router.get("/admin/id", protect, async (req, res) => {
     try {
       const admin = await AtlasUser.findOne({ role: "Administrator" }).select("_id fullName");
@@ -122,7 +123,7 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // Update user status
+  // ── Update user status ────────────────────────────────────
   router.put("/status", protect, async (req, res) => {
     try {
       const { status } = req.body;
@@ -135,23 +136,52 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // Admin: clear all messages between admin and a user
   router.delete("/messages/clear/:userId", protect, adminOnly, async (req, res) => {
     try {
-      const { userId } = req.params;
-      await AtlasMessage.deleteMany({
+      const rawUserId  = req.params.userId;
+      const rawAdminId = String(req.user._id);
+
+      console.log(`[chat/clear] admin=${rawAdminId} user=${rawUserId}`);
+
+      if (!mongoose.Types.ObjectId.isValid(rawUserId)) {
+        return res.status(400).json({ message: "Invalid userId" });
+      }
+
+      const userId  = new mongoose.Types.ObjectId(rawUserId);
+      const adminId = req.user._id; // ObjectId from protect middleware
+
+      // Log what we're about to delete
+      const before = await AtlasMessage.countDocuments({
         $or: [
-          { sender: req.user._id, receiver: userId },
-          { sender: userId,       receiver: req.user._id },
+          { sender: adminId, receiver: userId },
+          { sender: userId,  receiver: adminId },
         ],
       });
-      res.json({ ok: true, message: "Chat cleared" });
+      console.log(`[chat/clear] found ${before} messages to delete`);
+
+      const result = await AtlasMessage.deleteMany({
+        $or: [
+          { sender: adminId, receiver: userId },
+          { sender: userId,  receiver: adminId },
+        ],
+      });
+
+      console.log(`[chat/clear] deleted ${result.deletedCount} messages`);
+
+      const io = req.app.get("io");
+      if (io) {
+        io.to(rawUserId).emit("chatCleared");
+        console.log(`[chat/clear] chatCleared → room ${rawUserId}`);
+      }
+
+      res.json({ ok: true, deleted: result.deletedCount });
     } catch (err) {
+      console.error("[chat/clear] ERROR:", err.message, err.stack);
       res.status(500).json({ message: err.message });
     }
   });
 
-  // Cookie consent
+  // ── Cookie consent ────────────────────────────────────────
   router.put("/cookie-consent", protect, async (req, res) => {
     try {
       const { accepted } = req.body;
