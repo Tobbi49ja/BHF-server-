@@ -6,7 +6,8 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
   const { protect, adminOnly } = createAuthMiddleware(atlasConn);
   const router = express.Router();
 
-  // ── Unread count (MUST be before /messages/:userId) ──────
+  // ── Unread count ──────────────────────────────────────────
+  // MUST be declared before /messages/:userId to avoid route collision
   router.get("/messages/unread/count", protect, async (req, res) => {
     try {
       const count = await AtlasMessage.countDocuments({
@@ -19,25 +20,33 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // ── Get conversation ──────────────────────────────────────
+  // ── Get conversation + mark as read ──────────────────────
   router.get("/messages/:userId", protect, async (req, res) => {
     try {
-      const { userId } = req.params;
-      const me = req.user._id;
+      const otherId = req.params.userId;
+      const me      = req.user._id;
+
       const messages = await AtlasMessage.find({
         $or: [
-          { sender: me,     receiver: userId },
-          { sender: userId, receiver: me     },
+          { sender: me,      receiver: otherId },
+          { sender: otherId, receiver: me      },
         ],
       })
         .populate("sender",   "fullName role")
         .populate("receiver", "fullName role")
         .sort({ createdAt: 1 });
 
+      // Mark all messages FROM the other person TO me as read
       await AtlasMessage.updateMany(
-        { sender: userId, receiver: me, read: false },
+        { sender: otherId, receiver: me, read: false },
         { read: true }
       );
+
+      // Emit read-receipt so the other party's UI updates their ✓✓
+      const io = req.app.get("io");
+      if (io) {
+        io.to(String(otherId)).emit("messagesRead", { byUserId: String(me) });
+      }
 
       res.json(messages);
     } catch (err) {
@@ -64,13 +73,14 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
         { path: "receiver", select: "fullName role" },
       ]);
 
-      const io = req.app.get("io");
+      const io  = req.app.get("io");
+      const rid = String(receiverId);
+      const sid = String(req.user._id);
+
       if (io) {
-        const rid = String(receiverId);
-        const sid = String(req.user._id);
-        console.log(`[chat] emit newMessage → receiver ${rid}, sender ${sid}`);
+        // Emit to receiver — they see the incoming message
         io.to(rid).emit("newMessage", populated);
-        // Also echo to sender so their chat panel updates in real time
+        // Echo to sender's own room so their own UI confirms delivery
         if (rid !== sid) io.to(sid).emit("newMessage", populated);
       }
 
@@ -80,7 +90,7 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // ── Admin: all conversations with unread counts ───────────
+  // ── Admin: all conversations list ────────────────────────
   router.get("/admin/conversations", protect, adminOnly, async (req, res) => {
     try {
       const users = await AtlasUser.find({ role: { $ne: "Administrator" } })
@@ -91,15 +101,15 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
         users.map(async (u) => {
           const lastMsg = await AtlasMessage.findOne({
             $or: [
-              { sender: u._id, receiver: req.user._id },
-              { sender: req.user._id, receiver: u._id },
+              { sender: u._id,        receiver: req.user._id },
+              { sender: req.user._id, receiver: u._id        },
             ],
           }).sort({ createdAt: -1 });
 
           const unread = await AtlasMessage.countDocuments({
-            sender: u._id,
+            sender:   u._id,
             receiver: req.user._id,
-            read: false,
+            read:     false,
           });
 
           return { user: u, lastMessage: lastMsg, unread };
@@ -112,7 +122,7 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // ── Admin ID (for users to know who to message) ───────────
+  // ── Admin ID lookup ───────────────────────────────────────
   router.get("/admin/id", protect, async (req, res) => {
     try {
       const admin = await AtlasUser.findOne({ role: "Administrator" }).select("_id fullName");
@@ -123,41 +133,44 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
     }
   });
 
-  // ── Update user status ────────────────────────────────────
+  // ── User status update ────────────────────────────────────
   router.put("/status", protect, async (req, res) => {
     try {
       const { status } = req.body;
-      await AtlasUser.findByIdAndUpdate(req.user._id, { status, lastSeen: new Date() });
+      await AtlasUser.findByIdAndUpdate(req.user._id, {
+        status,
+        lastSeen: new Date(),
+      });
       const io = req.app.get("io");
-      if (io) io.emit("userStatus", { userId: req.user._id, status });
+      if (io) io.emit("userStatus", { userId: String(req.user._id), status });
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ message: err.message });
     }
   });
 
+  // ── Clear conversation (admin only) ──────────────────────
   router.delete("/messages/clear/:userId", protect, adminOnly, async (req, res) => {
     try {
       const rawUserId  = req.params.userId;
       const rawAdminId = String(req.user._id);
 
-      console.log(`[chat/clear] admin=${rawAdminId} user=${rawUserId}`);
-
       if (!mongoose.Types.ObjectId.isValid(rawUserId)) {
         return res.status(400).json({ message: "Invalid userId" });
       }
 
+      // Force ObjectId on BOTH sides — this is critical for deleteMany to
+      // match documents regardless of how Mongoose stored the refs internally.
       const userId  = new mongoose.Types.ObjectId(rawUserId);
-      const adminId = req.user._id; // ObjectId from protect middleware
+      const adminId = new mongoose.Types.ObjectId(rawAdminId);
 
-      // Log what we're about to delete
       const before = await AtlasMessage.countDocuments({
         $or: [
           { sender: adminId, receiver: userId },
           { sender: userId,  receiver: adminId },
         ],
       });
-      console.log(`[chat/clear] found ${before} messages to delete`);
+      console.log(`[chat/clear] admin=${rawAdminId} user=${rawUserId} → ${before} messages`);
 
       const result = await AtlasMessage.deleteMany({
         $or: [
@@ -165,13 +178,14 @@ export function createChatRouter(AtlasMessage, AtlasUser, atlasConn) {
           { sender: userId,  receiver: adminId },
         ],
       });
-
-      console.log(`[chat/clear] deleted ${result.deletedCount} messages`);
+      console.log(`[chat/clear] deleted ${result.deletedCount}`);
 
       const io = req.app.get("io");
       if (io) {
+        // User room — FloatingChat clears its local state
         io.to(rawUserId).emit("chatCleared");
-        console.log(`[chat/clear] chatCleared → room ${rawUserId}`);
+        // Admin room — AdminDashboard clears the correct panel
+        io.to(rawAdminId).emit("chatCleared", { forUserId: rawUserId });
       }
 
       res.json({ ok: true, deleted: result.deletedCount });
